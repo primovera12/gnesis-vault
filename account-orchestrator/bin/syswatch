@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# syswatch — read-only "what is using my CPU right now" report.
+# NON-DESTRUCTIVE. Never kills, stops, or changes anything. Just looks.
+# Run anytime BEFORE launching another heavy session/autopilot to see headroom.
+# Created 2026-06-09. Safe to run as often as you like.
+set -uo pipefail
+
+CORES=$(nproc)
+read -r L1 L5 L15 _ < /proc/loadavg
+# load-per-core ratio (bash integer math ×100)
+ratio=$(awk -v l="$L1" -v c="$CORES" 'BEGIN{printf "%d", (l/c)*100}')
+if   [ "$ratio" -lt 80 ];  then verdict="OK — headroom to start more";
+elif [ "$ratio" -lt 110 ]; then verdict="FULL — at capacity, new heavy work will queue";
+else                            verdict="SATURATED ${ratio}% — everything ~$(awk -v l=$L1 -v c=$CORES 'BEGIN{printf "%.1f",l/c}')x slower (stable, won't crash)"; fi
+
+echo "============================================================"
+echo " SYSWATCH  $(date '+%Y-%m-%d %H:%M:%S')"
+echo "============================================================"
+echo " Cores: $CORES   Load: $L1 (1m) $L5 (5m) $L15 (15m)"
+echo " CPU verdict: $verdict"
+echo "   (rule: load < ${CORES} = headroom, = ${CORES} = full, > ${CORES} = oversubscribed)"
+echo
+free -h | awk '/Mem:/{print " RAM:  "$3" used / "$2" total / "$7" available"} /Swap:/{print " Swap: "$3" used / "$2" total"}'
+echo
+echo "------ CPU by category (RANKING only — ps avg, not exact) ------"
+ps -eo pcpu,args --no-headers | awk '
+{
+  cpu=$1; line=$0;
+  if (line ~ /claude -p /)                                              cat="claude HEADLESS subagents (fleets)";
+  else if (line ~ /native-binary\/claude|bin\/claude| claude /)         cat="claude interactive sessions";
+  else if (line ~ /next-server|next dev|vite|webpack|esbuild|nodemon|ts-node|turbo|pnpm|npm exec|npm run/) cat="node dev/build servers (apps)";
+  else if (line ~ /dockerd|containerd|docker-proxy|docker/)             cat="docker engine";
+  else if (line ~ /postgres|redis-server|minio|mailpit/)               cat="docker services (db/cache)";
+  else if (line ~ /extensionHost|fileWatcher|vscode-server|tsserver|serverWorkerMain|language-feature/) cat="VS Code (windows/watchers/LSP)";
+  else if (line ~ /mcp|kit-rag|pal|selenium|stitch|github-mcp/)         cat="MCP servers";
+  else if (line ~ /python|MainThread|war-ministry/)                     cat="python daemons (war-ministry/hooks)";
+  else if (line ~ /\/bin\/bash|\/bin\/sh|^[ ]*[0-9.]+ bash/)            cat="shell/hooks";
+  else                                                                  cat="other (kernel/misc)";
+  sum[cat]+=cpu; n[cat]++;
+}
+END{ for (c in sum) printf " %6.1f  %-42s (%d procs)\n", sum[c], c, n[c]; }
+' | sort -rn
+echo
+echo "------ active claude fleets (the CPU multiplier) ------"
+FLEETS=$(ps -eo args --no-headers | grep -c 'claude -p ' || true)
+SESS=$(ps -eo args --no-headers | grep -E 'native-binary/claude|bin/claude' | grep -vc 'claude -p ' || true)
+echo " interactive sessions: ~$SESS    headless subagents (-p): $FLEETS"
+[ "$FLEETS" -gt 8 ] && echo " ⚠ $FLEETS headless subagents running — a heavy fan-out (audit/autopilot) is active. This is your top CPU source."
+echo
+echo "------ docker (CPU is near-0 unless a number is big) ------"
+if command -v docker >/dev/null 2>&1; then
+  docker stats --no-stream --format '{{.CPUPerc}}\t{{.Name}}' 2>/dev/null \
+    | sort -rn | awk '{c=$1; sub(/%/,"",c); if (c+0>5) print " ⚠ "$0" <-- check this one"; else idle++} END{if(idle)print " "idle" containers idle (<5% CPU) — RAM cost only, no CPU win in stopping them"}'
+else echo " docker not found"; fi
+echo "============================================================"
+echo " Non-destructive. To free CPU: stagger heavy fleets, or offload to cloud (claude.ai/code or /schedule)."

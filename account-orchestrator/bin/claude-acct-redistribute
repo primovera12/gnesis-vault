@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# claude-acct-redistribute — re-assign accounts across your ACTIVE projects.
+# Reads ~/.claude-accounts/projects.txt (one project path per line; # comments ok),
+# refreshes the live registry, and runs the distributor --apply so each project's
+# .vscode CLAUDE_CONFIG_DIR points at a healthy account — re-balancing as accounts
+# max out / recover. Run by a systemd-user timer; safe to run by hand.
+set -uo pipefail
+# Auto-discover ALL projects: the distributor, called with no project args, balances every
+# ~/projects/* git repo (worktrees excluded) — so newly-added folders are picked up + balanced
+# automatically on the next 30-min tick. No more hand-maintaining a fixed list.
+exec claude-acct-distribute --apply

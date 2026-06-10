@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# claude-acct-dashboard — Account Health widget, styled to match the War Ministry
+# Command Center (GENESIS BLUE tokens, Inter/JetBrains Mono, panels/badges/bars).
+# Reads ~/.claude-accounts.json (live %s from /api/oauth/usage). Auto-refreshes.
+#   claude-acct-dashboard [--open]
+# Output: ~/.claude-accounts/dashboard.html
+set -uo pipefail
+REG="$HOME/.claude-accounts.json"
+OUTDIR="$HOME/.claude-accounts"; OUT="$OUTDIR/dashboard.html"
+mkdir -p "$OUTDIR"; ARG="${1:-}"
+
+if [ "$ARG" = "--demo" ]; then
+  # demo mode: FAKE data only (no personal info) — for screenshots/video/public share
+  OUT="$OUTDIR/share/demo-dashboard.html"; mkdir -p "$(dirname "$OUT")"; REG="$(mktemp)"
+  cat > "$REG" <<'DEMO'
+{"a1":{"dir":"acct-personal","email":"you@example.com","tier":"max_20x","util_5h":34,"util_7d":12,"util_opus":0,"util_sonnet":4,"status":"VALID"},
+ "a2":{"dir":"acct-work","email":"work@example.com","tier":"max_20x","util_5h":78,"util_7d":41,"util_opus":2,"util_sonnet":18,"status":"VALID"},
+ "a3":{"dir":"acct-team","email":"team@example.com","tier":"max_20x","util_5h":100,"util_7d":62,"util_opus":0,"util_sonnet":9,"status":"MAXED"},
+ "a4":{"dir":"acct-client","email":"client@example.com","tier":"max_20x","util_5h":8,"util_7d":100,"util_opus":0,"util_sonnet":3,"status":"MAXED"},
+ "a5":{"dir":"acct-design","email":"design@example.com","tier":"max_20x","util_5h":0,"util_7d":100,"util_opus":0,"util_sonnet":0,"status":"MAXED"},
+ "a6":{"dir":"acct-ops","email":"ops@example.com","tier":"max_5x","util_5h":22,"util_7d":5,"util_opus":0,"util_sonnet":1,"status":"VALID"}}
+DEMO
+else
+  claude-acct-status >/dev/null 2>&1 || true
+fi
+[ -s "$REG" ] || echo '{}' > "$REG"
+STAMP="$(date '+%H:%M:%S')"
+VALID="$(jq '[.[]|select(.status=="VALID" or .status=="IDLE")]|length' "$REG" 2>/dev/null||echo 0)"
+DISTINCT="$(jq '[.[]|select(.status=="VALID" or .status=="IDLE").email]|unique|length' "$REG" 2>/dev/null||echo 0)"
+TOTAL="$(jq 'length' "$REG" 2>/dev/null||echo 0)"
+
+CARDS="$(jq -r '
+  def sc: if .status=="VALID" then "b-su" elif .status=="IDLE" then "b-su" elif .status=="MAXED" then "b-er" elif .status=="THROTTLED" then "b-wa" elif .status=="EXPIRED" then "b-er" else "b-mu" end;
+  def fill(u): if u>=90 then "var(--error)" elif u>=70 then "var(--warning)" else "var(--success)" end;
+  def bar(u;lbl): "<div class=rr><span class=rl>"+lbl+"</span><div class=barT><i style=\"width:"+(u|tostring)+"%;background:"+fill(u)+"\"></i></div><span class=rv>"+(u|tostring)+"%</span></div>";
+  ([.[].email]|group_by(.)|map({(.[0]):length})|add) as $c
+  | to_entries | sort_by(.value.util_7d, .value.util_5h) | .[] | .value
+  | (.util_5h//0) as $u5 | (.util_7d//0) as $u7 | ($c[.email]>1) as $dup
+  | "<div class=panel acct><div class=ph><h2 class=mono>"+(.dir|sub("^.*/";""))+"</h2>"
+    + "<div class=r><span class=\"bg "+(.|sc)+"\"><span class=bd></span>"+.status+"</span></div></div>"
+    + "<div class=abody>"
+    + "<div class=email>"+(.email//"?")+(if $dup then " <span class=dupb>DUPLICATE</span>" else "" end)+"</div>"
+    + bar($u5;"5-hour") + bar($u7;"7-day")
+    + "<div class=arow><span class=meta>"+(.tier//"?"|sub("default_claude_";""))+" · sonnet "+((.util_sonnet//0)|tostring)+"% · opus "+((.util_opus//0)|tostring)+"%</span>"
+    + "<a class=\"btn btn-s btn-sm\" href=\"https://claude.ai/settings/usage\" target=_blank rel=noopener>Usage ↗</a></div>"
+    + "</div></div>"
+' "$REG" 2>/dev/null)"
+
+# MISSING-account cards: any expected account (~/.claude-accounts/expected.txt) not
+# present in any credential dir renders as a red "MISSING — RE-AUTH" card, so a
+# displaced/overwritten account is VISIBLE instead of silently vanishing.
+EXP="$HOME/.claude-accounts/expected.txt"
+MISSING_CARDS=""; MISSING_N=0
+if [ -f "$EXP" ]; then
+  PRESENT="$(jq -r '[.[].email]|unique[]?' "$REG" 2>/dev/null)"
+  while IFS= read -r e; do
+    e="${e%%#*}"; e="$(echo "$e" | tr -d '[:space:]')"; [ -z "$e" ] && continue
+    if ! grep -qxF "$e" <<<"$PRESENT"; then
+      MISSING_N=$((MISSING_N+1))
+      MISSING_CARDS="$MISSING_CARDS<div class=\"panel acct\"><div class=ph><h2 class=mono>—</h2><div class=r><span class=\"bg b-er\"><span class=bd></span>MISSING</span></div></div><div class=abody><div class=email>$e <span class=dupb style=\"background:var(--error);color:#fff\">RE-AUTH</span></div><div class=meta style=\"margin-top:8px\">not authenticated in any slot — overwritten/displaced. Re-auth it into a free or duplicate slot.</div></div></div>"
+    fi
+  done < "$EXP"
+fi
+
+cat > "$OUT" <<HTML
+<!DOCTYPE html><html lang=en data-theme=light><head>
+<meta charset=UTF-8><meta name=viewport content="width=device-width,initial-scale=1">
+<meta http-equiv=refresh content=60><title>Accounts — War Ministry</title>
+<link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel=stylesheet>
+<style>
+:root{--brand:#1b3a67;--brand-hover:#142d52;--brand-accent:#3a6ea5;--brand-muted:#e7eef7;--bg:#f3e9d3;--surface:#fffdf7;--surface-muted:#ece3d0;--text:#13243f;--text-secondary:#4f5d72;--text-muted:#8b8775;--border:#e3dac6;--border-subtle:#efe8d8;--success:#2d7a52;--warning:#b07d1a;--error:#b8302b;--info:#2f5e96;--ring:0 0 0 1px rgba(27,58,103,.07);--whisper:rgba(27,58,103,.05) 0 4px 16px,rgba(27,58,103,.03) 0 1px 3px;--rc:12px;--rp:16px}
+[data-theme=dark]{--brand:#8fb8d4;--brand-hover:#a6c8df;--brand-accent:#bfd6e8;--brand-muted:rgba(143,184,212,.16);--bg:#1e1e1e;--surface:#262626;--surface-muted:#2f2f2d;--text:#fbf8f1;--text-secondary:#b9b3a6;--text-muted:#857f70;--border:rgba(255,255,255,.1);--border-subtle:rgba(255,255,255,.06);--success:#6ea585;--warning:#d8b46e;--error:#e89292;--info:#8fb8d4;--ring:0 0 0 1px rgba(255,255,255,.08);--whisper:rgba(0,0,0,.3) 0 4px 16px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.5;-webkit-font-smoothing:antialiased;min-height:100vh}
+.mono{font-family:'JetBrains Mono',monospace}
+.bb{height:3px;background:linear-gradient(90deg,var(--brand),var(--brand-accent),var(--info))}
+.top{display:flex;align-items:center;gap:13px;padding:14px 24px;border-bottom:1px solid var(--border-subtle);position:sticky;top:0;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);z-index:20}
+.brand{display:flex;align-items:center;gap:9px;font-size:16px;font-weight:600;color:var(--brand)}.brand .mk{width:24px;height:24px;border-radius:7px;background:var(--brand);color:var(--surface);display:grid;place-items:center;font-size:13px}
+.top .r{margin-inline-start:auto;display:flex;align-items:center;gap:10px}
+.live{display:flex;align-items:center;gap:6px;font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--text-muted)}.live .d{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px var(--success);animation:pp 1.6s infinite}@keyframes pp{0%,100%{opacity:1}50%{opacity:.4}}
+.ibtn{width:32px;height:32px;border-radius:8px;background:var(--surface);border:1px solid var(--border);color:var(--text);cursor:pointer;font-size:14px;display:grid;place-items:center}.ibtn:hover{background:var(--surface-muted)}
+.wrap{padding:18px 24px 44px;display:flex;flex-direction:column;gap:16px;max-width:1400px;margin:0 auto}
+.vh h1{font-size:22px;font-weight:600;letter-spacing:-.01em}.vh p{font-size:12.5px;color:var(--text-secondary);margin-top:3px}
+.ribbon{display:flex;gap:10px;flex-wrap:wrap}
+.rb-k{flex:1;min-width:130px;background:var(--surface);border:1px solid var(--border);border-radius:var(--rc);padding:11px 14px;box-shadow:var(--ring)}
+.rb-k .l{font-size:10.5px;color:var(--text-muted);font-weight:500;display:flex;align-items:center;gap:5px}.rb-k .l .dot{width:8px;height:8px;border-radius:50%}.rb-k .v{font-size:24px;font-weight:600;letter-spacing:-.01em}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--rp);box-shadow:var(--ring);overflow:hidden}
+.ph{display:flex;align-items:center;gap:8px;padding:11px 15px;border-bottom:1px solid var(--border-subtle)}.ph h2{font-size:14px;font-weight:600}.ph .r{margin-inline-start:auto;display:flex;gap:6px;align-items:center}
+.abody{padding:12px 15px}
+.email{font-size:13px;color:var(--text-secondary);margin-bottom:11px;display:flex;align-items:center;gap:7px}
+.dupb{font-size:9px;font-weight:700;color:var(--error);border:1px solid var(--error);border-radius:4px;padding:0 5px;letter-spacing:.04em}
+.rr{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:12px}.rr .rl{width:52px;color:var(--text-secondary);font-size:11.5px}.barT{flex:1;height:7px;border-radius:4px;background:var(--surface-muted);overflow:hidden}.barT i{display:block;height:100%;border-radius:4px}.rr .rv{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-muted);width:46px;text-align:end}
+.arow{display:flex;align-items:center;gap:8px;margin-top:11px}.meta{font-size:11px;color:var(--text-muted);flex:1}
+.bg{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:500;white-space:nowrap}.bg .bd{width:6px;height:6px;border-radius:50%;background:currentColor}
+.b-su{background:rgba(45,122,82,.13);color:var(--success)}.b-wa{background:rgba(176,125,26,.14);color:var(--warning)}.b-er{background:rgba(184,48,43,.12);color:var(--error)}.b-mu{background:var(--surface-muted);color:var(--text-muted)}
+.btn{display:inline-flex;align-items:center;gap:6px;justify-content:center;padding:6px 12px;border-radius:8px;font-size:12.5px;font-weight:500;font-family:inherit;cursor:pointer;border:none;text-decoration:none;transition:all .15s;white-space:nowrap}
+.btn-s{background:transparent;color:var(--text);border:1px solid var(--border)}.btn-s:hover{background:var(--surface-muted);border-color:var(--brand);color:var(--brand)}.btn-sm{padding:4px 10px;font-size:11.5px}
+.foot{font-size:11px;color:var(--text-muted);margin-top:6px}
+@media(min-width:1080px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(min-width:1480px){.grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:430px){.grid{grid-template-columns:1fr}}
+.abody{padding:11px 13px}.email{font-size:12.5px}.ph{padding:10px 13px}
+</style></head><body>
+<div class=bb></div>
+<div class=top><div class=brand><span class=mk>⚔</span> War Ministry</div>
+<div class=r><div class=live><span class=d></span> refreshed $STAMP</div><button class=ibtn id=themeBtn title="toggle theme">◐</button></div></div>
+<div class=wrap>
+<div class=vh><h1>Claude Accounts — Live Usage</h1><p>5h / 7d / per-model utilization live from /api/oauth/usage · identity from /api/oauth/profile · auto-refreshes every 60s</p></div>
+<div class=ribbon>
+  <div class=rb-k><div class=l><span class=dot style="background:var(--success)"></span>Usable now</div><div class=v style="color:var(--success)">$VALID</div></div>
+  <div class=rb-k><div class=l><span class=dot style="background:var(--brand)"></span>Distinct live</div><div class=v>$DISTINCT</div></div>
+  <div class=rb-k><div class=l><span class=dot style="background:var(--text-muted)"></span>Total accounts</div><div class=v>$TOTAL</div></div>
+</div>
+<div class=grid>$CARDS$MISSING_CARDS</div>
+<div class=foot>registry: ~/.claude-accounts.json · styled to match the War Ministry Command Center (GENESIS BLUE)</div>
+</div>
+<script>
+(function(){var k='acct-dash-theme',t=localStorage.getItem(k)||'light';document.documentElement.dataset.theme=t;
+document.getElementById('themeBtn').onclick=function(){var n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.setItem(k,n)};})();
+</script>
+</body></html>
+HTML
+
+echo "dashboard → $OUT  (usable $VALID/$TOTAL, $DISTINCT distinct, $STAMP)"
+[ "$ARG" = "--open" ] && { command -v wslview >/dev/null && wslview "$OUT" 2>/dev/null || explorer.exe "$(wslpath -w "$OUT")" 2>/dev/null || true; }

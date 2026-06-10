@@ -1,0 +1,56 @@
+name: Package skills
+
+# Every push to main re-packages each top-level skill folder (any directory
+# containing a SKILL.md) into <skill>.tar.gz and (re)uploads them to a single
+# rolling "latest" release. The Vault (gnesis.dev/vault) streams those assets,
+# so publishing a skill update is just: push to main. No site redeploy.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-skills
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package each skill folder into a tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          found=0
+          for d in */ ; do
+            name="${d%/}"
+            if [ -f "$name/SKILL.md" ]; then
+              tar czf "dist/$name.tar.gz" "$name"
+              echo "packaged $name -> dist/$name.tar.gz ($(wc -c < "dist/$name.tar.gz") bytes)"
+              found=$((found + 1))
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no skill folders (containing SKILL.md) found to package"
+            exit 1
+          fi
+          ls -l dist
+
+      - name: Publish / refresh the 'latest' release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest dist/*.tar.gz --clobber
+          else
+            gh release create latest dist/*.tar.gz \
+              --title "Latest skills" \
+              --notes "Auto-packaged tarballs of each Vault skill. Always the newest build from main — download URLs stay stable at /releases/latest/download/<skill>.tar.gz."
+          fi

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# claude-best — drop-in for `claude` that auto-selects the FRESHEST account under the
+# switch threshold (5h & 7d < 97%). Every new process auto-lands on a non-near-max
+# account = automatic switching BEFORE the session-limit error.
+#
+# Use it anywhere you'd call claude, especially in autopilots / loops / spawners:
+#   claude-best -p "..."            # headless subagent on the freshest account
+#   claude-best                     # interactive on the freshest account
+# Reads the registry (kept fresh by the 10-min dashboard timer) — no per-spawn API cost.
+# Override the threshold:  ACCT_SWITCH_PCT=90 claude-best ...
+set -uo pipefail
+PCT="${ACCT_SWITCH_PCT:-97}"
+DIR="$(claude-acct-status --current "$PCT" 2>/dev/null)"
+[ -z "$DIR" ] && DIR="$HOME/.claude"   # all accounts near-max → fall back to default
+exec env CLAUDE_CONFIG_DIR="$DIR" claude "$@"

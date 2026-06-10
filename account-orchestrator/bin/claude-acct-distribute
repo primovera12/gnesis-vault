@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# claude-acct-distribute — the account ORCHESTRATOR.
+# Auto-distributes your authed Claude accounts across your projects so each
+# project's VS Code window runs on a DIFFERENT account = a different rate-limit
+# budget. No more one project's fan-out storming every session.
+#
+# Mechanism: writes  claudeCode.environmentVariables.CLAUDE_CONFIG_DIR  into each
+# project's .vscode/settings.json (merge-safe — never clobbers other settings).
+# Stable + balanced: keeps existing assignments (leases) and balances new ones
+# across the least-loaded accounts. Re-run anytime; it's idempotent.
+#
+# Auth/sync of the accounts themselves = the `claude-acct-reauth` skill (separate).
+# This tool only DISTRIBUTES already-authed accounts.
+#
+# Usage:
+#   claude-acct-distribute                 # dry-run: show the assignment, write nothing
+#   claude-acct-distribute --apply         # write the .vscode/settings.json files
+#   claude-acct-distribute --list          # show current leases
+#   claude-acct-distribute --apply P1 P2   # only these project paths
+#   (default project set: every dir under ~/projects that is a git repo or has .vscode)
+set -uo pipefail
+
+LEASES="$HOME/.claude-acct-leases.json"
+MODE="dryrun"; PROJECTS=()
+for a in "$@"; do
+  case "$a" in
+    --apply) MODE="apply" ;;
+    --list)  MODE="list" ;;
+    --dry-run) MODE="dryrun" ;;
+    -*) echo "unknown flag: $a" >&2; exit 1 ;;
+    *)  PROJECTS+=("$a") ;;
+  esac
+done
+
+# --- 1. POOL = LIVE usable accounts from the health registry ---
+# The registry (claude-acct-status) keys by reliable /api/oauth/profile email and
+# live /api/oauth/usage %, so it dedups by real account AND skips MAXED/EXPIRED.
+# --healthy returns one dir per distinct usable account, FRESHEST (lowest util) first.
+claude-acct-status >/dev/null 2>&1 || true   # refresh live usage
+POOL=(); while IFS= read -r line; do [ -n "$line" ] && POOL+=("$line"); done < <(claude-acct-status --healthy 2>/dev/null)
+LIVE=${#POOL[@]}
+if [ "$LIVE" -eq 0 ]; then
+  echo "  ⚠ NO live accounts (all maxed/expired right now) — falling back to all distinct logins (they'll share the cap)" >&2
+  declare -A SEEN_TOK
+  for d in "$HOME/.claude" "$HOME"/.claude-acct[0-9]*; do
+    case "$d" in *.disabled*|*.bak|*.empty*) continue ;; esac
+    [ -f "$d/.credentials.json" ] || continue
+    tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$d/.credentials.json" 2>/dev/null | sha256sum | cut -c1-16)
+    [ -z "$tok" ] && continue
+    [ -n "${SEEN_TOK[$tok]:-}" ] && continue
+    SEEN_TOK[$tok]="$d"; POOL+=("$d")
+  done
+fi
+[ "${#POOL[@]}" -eq 0 ] && { echo "no authed accounts found (~/.claude*/.credentials.json)"; exit 1; }
+echo "  pool: ${#POOL[@]} accounts ($LIVE live, freshest first)" >&2
+[ "$LIVE" = 1 ] && echo "  ⚠ only 1 live account — every project will share it until others reset (your real bottleneck)" >&2
+
+# --- 2. discover PROJECTS (if none passed) ---
+if [ "${#PROJECTS[@]}" -eq 0 ]; then
+  for p in "$HOME"/projects/*/; do
+    p="${p%/}"; b="$(basename "$p")"
+    case "$b" in Master-Kit-s*|*-wt-*|*-worktree*|.*) continue ;; esac   # skip git worktrees + dotdirs
+    { [ -d "$p/.git" ] || [ -d "$p/.vscode" ]; } && PROJECTS+=("$p")
+  done
+fi
+
+[ -f "$LEASES" ] || echo '{}' > "$LEASES"
+
+if [ "$MODE" = "list" ]; then
+  echo "Authed accounts (${#POOL[@]}): ${POOL[*]/#$HOME\//~/}"
+  echo "Current leases:"; jq -r 'to_entries[]? | "  \(.key)  ->  \(.value)"' "$LEASES" 2>/dev/null || echo "  (none)"
+  exit 0
+fi
+
+# --- 3. assign: keep valid existing leases, balance the rest onto least-loaded accounts ---
+declare -A LOAD; for a in "${POOL[@]}"; do LOAD["$a"]=0; done
+declare -A ASSIGN
+in_pool(){ local x="$1"; for a in "${POOL[@]}"; do [ "$a" = "$x" ] && return 0; done; return 1; }
+# balance cap — so stale leases (e.g. from when only 1 account was live) can't pin
+# everything onto one account. ceil(projects / pool).
+CAP=$(( ( ${#PROJECTS[@]} + ${#POOL[@]} - 1 ) / ${#POOL[@]} ))
+# pass 1 — honor existing leases, but ONLY up to the balance cap
+for proj in "${PROJECTS[@]}"; do
+  cur="$(jq -r --arg k "$proj" '.[$k] // empty' "$LEASES" 2>/dev/null)"
+  if [ -n "$cur" ] && in_pool "$cur" && [ "${LOAD[$cur]:-0}" -lt "$CAP" ]; then ASSIGN["$proj"]="$cur"; LOAD["$cur"]=$(( ${LOAD["$cur"]} + 1 )); fi
+done
+# pass 2 — assign the unleased to the least-loaded account
+for proj in "${PROJECTS[@]}"; do
+  [ -n "${ASSIGN[$proj]:-}" ] && continue
+  best=""; min=999999
+  for a in "${POOL[@]}"; do if [ "${LOAD[$a]}" -lt "$min" ]; then min="${LOAD[$a]}"; best="$a"; fi; done
+  ASSIGN["$proj"]="$best"; LOAD["$best"]=$(( ${LOAD["$best"]} + 1 ))
+done
+
+# --- 4. report + (apply) write per-project .vscode/settings.json ---
+printf '%-46s  %s\n' "PROJECT" "ACCOUNT"
+printf '%-46s  %s\n' "-------" "-------"
+tmp_leases="$(jq '.' "$LEASES" 2>/dev/null || echo '{}')"
+for proj in "${PROJECTS[@]}"; do
+  acct="${ASSIGN[$proj]}"
+  printf '%-46s  %s\n' "${proj/#$HOME\//~/}" "${acct/#$HOME\//~/}"
+  tmp_leases="$(echo "$tmp_leases" | jq --arg k "$proj" --arg v "$acct" '.[$k]=$v')"
+  if [ "$MODE" = "apply" ]; then
+    mkdir -p "$proj/.vscode"
+    f="$proj/.vscode/settings.json"
+    [ -s "$f" ] || echo '{}' > "$f"
+    # schema-correct: claudeCode.environmentVariables is an ARRAY of {name,value}.
+    # merge-safe: convert any legacy object form, drop the old CLAUDE_CONFIG_DIR entry, append the new one.
+    merged="$(jq --arg dir "$acct" '
+      (.["claudeCode.environmentVariables"] // []) as $cur
+      | (if ($cur|type)=="array" then $cur
+         elif ($cur|type)=="object" then ($cur|to_entries|map({name:.key,value:(.value|tostring)}))
+         else [] end) as $arr
+      | .["claudeCode.environmentVariables"] =
+          (($arr|map(select(.name != "CLAUDE_CONFIG_DIR"))) + [{name:"CLAUDE_CONFIG_DIR",value:$dir}])
+    ' "$f" 2>/dev/null)"
+    if [ -n "$merged" ]; then echo "$merged" > "$f"; else echo "  ! could not merge $f (invalid JSON?) — skipped" >&2; fi
+  fi
+done
+echo "$tmp_leases" > "$LEASES"
+
+echo
+echo "Account load: $(for a in "${POOL[@]}"; do echo -n "${a##*/}=${LOAD[$a]} "; done)"
+if [ "$MODE" = "apply" ]; then
+  echo "APPLIED. Reload each VS Code window (Developer: Reload Window) to pick up its account."
+else
+  echo "DRY-RUN — nothing written. Re-run with --apply to write the .vscode/settings.json files."
+fi

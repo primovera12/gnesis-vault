@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# claude-acct-autoswap — AUTOMATIC, no-reload account switching for RUNNING chats.
+#
+# For each credential dir a live claude chat is using, if that dir's account is near
+# its limit, swap the dir's creds to a FRESH idle account. The running chat re-reads
+# its credential file on the next message and switches accounts — NO window reload.
+# (Mechanism proven: a running Claude Code chat re-reads CLAUDE_CONFIG_DIR/.credentials.json.)
+#
+# HEAVY-TASK ISOLATION: a chat running probe / research / autopilot (sub-agent heavy)
+# gets its account RESERVED — it's left alone AND never used as a switch target, so the
+# heavy task keeps an uncontended account and doesn't get rate-limited.
+#
+#   claude-acct-autoswap            # do it (intended for a frequent timer)
+#   claude-acct-autoswap --dry-run  # show what it would switch, write nothing
+#   ACCT_SWITCH_PCT=90 (default)    # switch when an account's max(5h,7d) >= this
+set -uo pipefail
+THRESH="${ACCT_SWITCH_PCT:-90}"
+REG="$HOME/.claude-accounts.json"
+STATE="$HOME/.local/state"; mkdir -p "$STATE"; LOG="$STATE/acct-autoswap.log"
+PARK="$HOME/.claude-accounts/parked"; mkdir -p "$PARK"
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
+claude-acct-status >/dev/null 2>&1 || true
+
+declare -A ACTIVE HEAVY HEAVYN
+for pid in $(pgrep -f claude 2>/dev/null); do
+  [ -d "/proc/$pid" ] || continue
+  ccd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^CLAUDE_CONFIG_DIR=' | cut -d= -f2-)
+  [ -z "$ccd" ] && ccd="$HOME/.claude"
+  ACTIVE["$ccd"]=1
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+  case "$cmd" in *probe*|*research*|*-autopilot*|*gsd-autopilot*|*website-builder*|*deep-audit*|*' fix'*)
+    HEAVY["$ccd"]=1; HEAVYN["$ccd"]=$(( ${HEAVYN[$ccd]:-0} + 1 )) ;; esac
+done
+# heavy-collision warning: 2+ heavy tasks on ONE account = contention. Same launch dir can't
+# be split at runtime (relaunch each on its own account via the per-window binder); distinct
+# dirs sharing one account-email get one moved by the switch pass below.
+declare -A HEMAIL
+for d in "${!HEAVY[@]}"; do
+  em=$(jq -r --arg d "$d" '.[$d].email//"?"' "$REG" 2>/dev/null)
+  HEMAIL["$em"]=$(( ${HEMAIL[$em]:-0} + ${HEAVYN[$d]:-1} ))
+done
+for em in "${!HEMAIL[@]}"; do
+  [ "${HEMAIL[$em]}" -ge 2 ] && echo "⚠ HEAVY COLLISION: ${HEMAIL[$em]} heavy tasks on $em — give each its own account (launch via per-window binder / separate folders)"
+done
+
+emailof(){ jq -r --arg d "$1" '.[$d].email // "?"' "$REG" 2>/dev/null; }
+utilof(){  jq -r --arg d "$1" '[(.[$d].util_5h//0),(.[$d].util_7d//0)]|max' "$REG" 2>/dev/null; }
+
+declare -A RESERVED
+for d in "${!HEAVY[@]}"; do RESERVED["$(emailof "$d")"]=1; done
+
+acted=0
+for dir in "${!ACTIVE[@]}"; do
+  [ -f "$dir/.credentials.json" ] || continue
+  curem=$(emailof "$dir")
+  if [ -n "${HEAVY[$dir]:-}" ]; then echo "🔒 RESERVED (heavy task) — left alone: $(basename "$dir") = $curem"; continue; fi
+  pct=$(utilof "$dir")
+  awk "BEGIN{exit !(${pct:-0} >= $THRESH)}" || continue
+  # target = freshest VALID/refreshable account that is IDLE (no live chat), under threshold,
+  # not reserved-for-heavy, and a different account than this dir's current one.
+  # target = the FRESHEST account with real headroom (idle preferred via sort, but a
+  # busy-yet-fresh account is fine — it has room to absorb). Excludes reserved-for-heavy
+  # accounts and this dir's own account. Only switch to something meaningfully fresher.
+  target=""
+  while IFS= read -r cand; do
+    [ -z "$cand" ] && continue
+    cem=$(emailof "$cand"); [ "$cem" = "$curem" ] && continue
+    [ -n "${RESERVED[$cem]:-}" ] && continue
+    cpct=$(utilof "$cand")
+    awk "BEGIN{exit !(${cpct:-0} <= ${pct:-100} - 15)}" || continue   # must be >=15pts fresher
+    target="$cand"; break
+  done < <(jq -r --argjson p "$THRESH" '[to_entries[].value|select(.status=="VALID" or (.status=="EXPIRED" and (.has_refresh//false)))]|sort_by([(.util_5h//0),(.util_7d//0)]|max)|.[]|select((.util_5h//0)<$p and (.util_7d//0)<$p)|.dir' "$REG" 2>/dev/null)
+  if [ -z "$target" ]; then echo "⚠ $(basename "$dir") ($curem ${pct}%) near limit — every other account is also loaded/reserved (capacity tight), leaving it"; continue; fi
+  tgtem=$(emailof "$target")
+  if [ "$DRY" = 1 ]; then echo "WOULD SWITCH $(basename "$dir"): $curem (${pct}%) → $tgtem (idle)"; else
+    cp "$dir/.credentials.json" "$PARK/$(echo "$curem"|tr -c 'a-zA-Z0-9' '_').$(date +%s).json" 2>/dev/null || true
+    cp "$target/.credentials.json" "$dir/.credentials.json" && chmod 600 "$dir/.credentials.json"
+    echo "$(date '+%F %T') AUTOSWAP $(basename "$dir") $curem(${pct}%) -> $tgtem" >> "$LOG"
+    echo "✅ SWITCHED $(basename "$dir"): $curem (${pct}%) → $tgtem  (its chats switch on next message, no reload)"
+  fi
+  acted=$((acted+1))
+done
+[ "$acted" = 0 ] && [ "${#ACTIVE[@]}" -gt 0 ] && echo "all active accounts under ${THRESH}% (or reserved) — nothing to switch"
+exit 0

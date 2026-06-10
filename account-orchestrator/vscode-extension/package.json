@@ -1,0 +1,15 @@
+{
+  "name": "account-orchestrator-binder",
+  "displayName": "Account Orchestrator — per-window account binder",
+  "description": "Binds each VS Code window's Claude Code session to a distinct account from the orchestrator pool — automatically, no per-chat reload.",
+  "version": "1.0.0",
+  "publisher": "account-orchestrator",
+  "engines": { "vscode": "^1.70.0" },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "accountOrchestrator.show", "title": "Account Orchestrator: Show this window's account" }
+    ]
+  }
+}

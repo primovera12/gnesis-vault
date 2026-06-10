@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# claude-acct-status — Account Health Registry (the smart core).
+# Builds/reads ~/.claude-accounts.json so EVERY tool (distributor, governor,
+# autopilots, cloud round-robin, dashboard) can pick the FRESHEST account and
+# skip dead/maxed ones.
+#
+# LIVE DATA via the OAuth endpoints (NO inference cost — these are free GETs):
+#   GET https://api.anthropic.com/api/oauth/usage    -> five_hour.utilization,
+#       seven_day.utilization, seven_day_opus/sonnet.utilization, resets_at
+#   GET https://api.anthropic.com/api/oauth/profile  -> account.email (cache-proof identity)
+# So we DO have real %s: session(5h) %, weekly(7d) %, per-model weekly %, + resets.
+# (My earlier "no % available" was wrong — this endpoint exposes it.)
+#
+# status = EXPIRED  (usage endpoint 401/403 → token dead → claude-acct-reauth)
+#        | MAXED    (5h>=99% OR 7d>=99% → at a cap; wait for the reset)
+#        | THROTTLED(manual cooldown via --throttle, set on an observed 429)
+#        | VALID    (usable; lower utilization = fresher = preferred)
+#
+# Usage:
+#   claude-acct-status            # live refresh + table
+#   claude-acct-status --probe    # alias (the pull is already free)
+#   claude-acct-status --throttle DIR [MIN]
+#   claude-acct-status --healthy  # VALID dirs, FRESHEST (lowest util) first — for the scheduler
+#   claude-acct-status --json
+set -uo pipefail
+REG="$HOME/.claude-accounts.json"
+NOW=$(date +%s)
+[ -s "$REG" ] || echo '{}' > "$REG"
+OAH=(-H "anthropic-beta: oauth-2025-04-20" -H "anthropic-version: 2023-06-01" -H "User-Agent: claude-cli/2.1.0")
+API="https://api.anthropic.com"
+
+MODE="check"; THR_DIR=""; THR_MIN=300
+case "${1:-}" in
+  --probe) MODE="check" ;;
+  --throttle) MODE="throttle"; THR_DIR="${2:-}"; THR_MIN="${3:-300}" ;;
+  --healthy) MODE="healthy" ;;
+  --current) MODE="current" ;;
+  --json) MODE="json" ;;
+esac
+
+pools(){ for d in "$HOME/.claude" "$HOME"/.claude-acct[0-9]*; do case "$d" in *.disabled*|*.bak|*.empty*) continue;; esac; [ -f "$d/.credentials.json" ] && echo "$d"; done; }
+
+if [ "$MODE" = "throttle" ]; then
+  [ -n "$THR_DIR" ] || { echo "usage: --throttle DIR [MIN]" >&2; exit 1; }
+  until=$(( NOW + THR_MIN*60 ))
+  jq --arg k "$THR_DIR" --argjson u "$until" --argjson n "$NOW" \
+    '.[$k] = ((.[$k] // {dir:$k}) + {status:"THROTTLED", cooldown_until:$u, last_checked:$n})' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
+  echo "marked $(basename "$THR_DIR") THROTTLED for ${THR_MIN}m"; exit 0
+fi
+if [ "$MODE" = "json" ]; then cat "$REG"; exit 0; fi
+if [ "$MODE" = "healthy" ]; then
+  # VALID accounts only, deduped by EMAIL (one login per real account), FRESHEST first
+  # (lowest of 5h/7d utilization) — this is what the distributor/scheduler consumes.
+  jq -r '[to_entries[].value | select(.status=="VALID" or .status=="IDLE")]
+         | group_by(.email) | map(min_by([(.util_5h//0),(.util_7d//0)]|max))
+         | sort_by([(.util_5h//0),(.util_7d//0)]|max) | .[].dir' "$REG" 2>/dev/null
+  exit 0
+fi
+if [ "$MODE" = "current" ]; then
+  # the single FRESHEST usable account whose 5h AND 7d are BELOW the switch threshold
+  # (default 97). Spawners use:  CLAUDE_CONFIG_DIR=$(claude-acct-status --current) claude ...
+  # → every new process auto-lands on a non-near-max account = auto-switch before the limit.
+  PCT="${2:-97}"
+  jq -r --argjson p "$PCT" '[to_entries[].value | select(.status=="VALID" or .status=="IDLE")
+         | select((.util_5h//0) < $p and (.util_7d//0) < $p)]
+         | sort_by([(.util_5h//0),(.util_7d//0)]|max) | .[0].dir // empty' "$REG" 2>/dev/null
+  exit 0
+fi
+
+# --- refresh: live usage pull per account ---
+out="$(jq -c . "$REG" 2>/dev/null)"; [ -n "$out" ] || out='{}'   # tolerate empty/corrupt registry
+for d in $(pools); do
+  c="$d/.credentials.json"
+  tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$c" 2>/dev/null)
+  tier=$(jq -r '.claudeAiOauth.rateLimitTier // "?"' "$c" 2>/dev/null)
+  sub=$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$c" 2>/dev/null)
+  cd=$(echo "$out" | jq -r --arg k "$d" '.[$k].cooldown_until // 0'); cd=${cd:-0}
+  # carry prior values so a transient failed pull doesn't blank the board
+  email=$(echo "$out" | jq -r --arg k "$d" '.[$k].email // ""')
+  u5=$(echo "$out" | jq -r --arg k "$d" '.[$k].util_5h // 0')
+  u7=$(echo "$out" | jq -r --arg k "$d" '.[$k].util_7d // 0')
+  r5=$(echo "$out" | jq -r --arg k "$d" '.[$k].reset_5h // ""')
+  r7=$(echo "$out" | jq -r --arg k "$d" '.[$k].reset_7d // ""')
+  uo=$(echo "$out" | jq -r --arg k "$d" '.[$k].util_opus // 0')
+  us=$(echo "$out" | jq -r --arg k "$d" '.[$k].util_sonnet // 0')
+  code="cached"
+  if [ -n "$tok" ]; then
+    em=$(curl -s -m 15 "$API/api/oauth/profile" -H "Authorization: Bearer $tok" "${OAH[@]}" 2>/dev/null | jq -r '.account.email // ""' 2>/dev/null)
+    [ -n "$em" ] && email="$em"
+    resp=$(curl -s -m 15 -w '|%{http_code}' "$API/api/oauth/usage" -H "Authorization: Bearer $tok" "${OAH[@]}" 2>/dev/null)
+    code="${resp##*|}"; body="${resp%|*}"
+    if [ "$code" = "200" ]; then
+      u5=$(echo "$body" | jq -r '.five_hour.utilization // 0' 2>/dev/null)
+      r5=$(echo "$body" | jq -r '.five_hour.resets_at // ""' 2>/dev/null)
+      u7=$(echo "$body" | jq -r '.seven_day.utilization // 0' 2>/dev/null)
+      r7=$(echo "$body" | jq -r '.seven_day.resets_at // ""' 2>/dev/null)
+      uo=$(echo "$body" | jq -r '.seven_day_opus.utilization // 0' 2>/dev/null)
+      us=$(echo "$body" | jq -r '.seven_day_sonnet.utilization // 0' 2>/dev/null)
+    fi
+  fi
+  # numeric guards (empty/null → 0)
+  u5=${u5:-0}; u7=${u7:-0}; uo=${uo:-0}; us=${us:-0}
+  case "$u5" in ''|*[!0-9.]*) u5=0;; esac; case "$u7" in ''|*[!0-9.]*) u7=0;; esac
+  case "$uo" in ''|*[!0-9.]*) uo=0;; esac; case "$us" in ''|*[!0-9.]*) us=0;; esac
+  # refreshable? a stale (expired) access-token WITH a refresh_token is still USABLE — Claude
+  # Code refreshes it on use. So it's IDLE (usable, just not recently active), NOT dead.
+  hr=$(jq -e '(.claudeAiOauth.refreshToken // "")|length>0' "$d/.credentials.json" >/dev/null 2>&1 && echo true || echo false)
+  if   [ -n "$tok" ] && [ "$code" != "200" ] && [ "$code" != "cached" ]; then
+         if [ "$hr" = true ]; then status="IDLE"; else status="EXPIRED"; fi   # IDLE=stale token, refreshable=usable
+  elif awk -v a="$u5" -v b="$u7" 'BEGIN{exit !(a+0>=99 || b+0>=99)}'; then status="MAXED";
+  elif [ "$cd" -gt "$NOW" ]; then status="THROTTLED";
+  else status="VALID"; fi
+  out=$(echo "$out" | jq --arg k "$d" --arg em "$email" --arg t "$tier" --arg s "$sub" \
+    --argjson u5 "${u5:-0}" --arg r5 "$r5" --argjson u7 "${u7:-0}" --arg r7 "$r7" \
+    --argjson uo "${uo:-0}" --argjson us "${us:-0}" --arg st "$status" --argjson cd "$cd" \
+    --arg code "$code" --argjson now "$NOW" --argjson hr "$hr" \
+    '.[$k]={dir:$k,email:$em,tier:$t,sub:$s,util_5h:$u5,reset_5h:$r5,util_7d:$u7,reset_7d:$r7,util_opus:$uo,util_sonnet:$us,status:$st,has_refresh:$hr,http:$code,cooldown_until:$cd,last_checked:$now}')
+done
+echo "$out" > "$REG"
+
+printf '%-14s %-26s %-7s %-7s %-7s %-7s %s\n' "ACCT" "EMAIL" "5-HOUR" "7-DAY" "OPUS" "SONNET" "STATUS"
+printf '%-14s %-26s %-7s %-7s %-7s %-7s %s\n' "----" "-----" "------" "-----" "----" "------" "------"
+echo "$out" | jq -r 'to_entries[] | [(.key|sub("^.*/";"")), (.value.email//"?"), (.value.util_5h//0), (.value.util_7d//0), (.value.util_opus//0), (.value.util_sonnet//0), .value.status]|@tsv' \
+| while IFS=$'\t' read -r name email u5 u7 uo us st; do
+    printf '%-14s %-26s %-7s %-7s %-7s %-7s %s\n' "$name" "${email:0:25}" "${u5}%" "${u7}%" "${uo}%" "${us}%" "$st"
+  done
+echo
+H=$(echo "$out" | jq '[.[]|select(.status=="VALID" or .status=="IDLE")]|length' 2>/dev/null)
+echo "usable now: ${H:-0} · live via /api/oauth/usage · registry: $REG"

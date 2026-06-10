@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# claude-usage <acctN | email | all>  — open claude.ai/settings/usage in the
+# browser you've mapped to that account, so you land on the RIGHT account.
+#
+# Why: claude.ai/settings/usage shows whichever account THAT browser is signed
+# into. So map each account-email to the browser (or browser profile) where it's
+# signed in. Edit the map at: ~/.claude-accounts/browser-map.json
+#   { "you@example.com": "chrome",
+#     "work@example.com":   "msedge",
+#     "home@example.com":"firefox",
+#     "team@example.com": "chrome --profile-directory=\"Profile 2\"" }
+# Values are passed to Windows `start`. Use a bare browser name, OR a browser +
+# --profile-directory / -P for per-profile accounts. Unmapped → default browser.
+set -uo pipefail
+REG="$HOME/.claude-accounts.json"
+MAP="$HOME/.claude-accounts/browser-map.json"
+URL="https://claude.ai/settings/usage"
+[ -f "$MAP" ] || { mkdir -p "$(dirname "$MAP")"; echo '{}' > "$MAP"; }
+
+resolve_email(){ # acctN/dir/email → email
+  local a="$1"
+  case "$a" in *@*) echo "$a"; return;; esac
+  local dir="$HOME/.claude"; [ "$a" != ".claude" ] && [ "$a" != "claude" ] && dir="$HOME/.claude-${a#.claude-}"; dir="${dir/acctacct/acct}"
+  [ "$a" = "$(basename "$a")" ] && [ -d "$HOME/$a" ] && dir="$HOME/$a"
+  jq -r --arg k "$dir" '.[$k].email // empty' "$REG" 2>/dev/null
+}
+open_one(){
+  local email="$1"
+  local br; br=$(jq -r --arg e "$email" '.[$e] // empty' "$MAP")
+  if [ -n "$br" ]; then
+    echo "→ $email  via  $br"
+    cmd.exe /c start "" $br "$URL" 2>/dev/null
+  else
+    echo "→ $email  (no browser mapped — opening default; add it to $MAP)"
+    cmd.exe /c start "" "$URL" 2>/dev/null
+  fi
+}
+arg="${1:-}"
+[ -z "$arg" ] && { echo "usage: claude-usage <acctN|email|all>   (map: $MAP)"; echo "current map:"; jq . "$MAP"; exit 0; }
+if [ "$arg" = "all" ]; then
+  jq -r 'keys[]?' "$MAP" | while read -r e; do open_one "$e"; sleep 1; done
+  exit 0
+fi
+em=$(resolve_email "$arg"); [ -z "$em" ] && em="$arg"
+open_one "$em"
