@@ -1,0 +1,22 @@
+{
+  "name": "auto-advance",
+  "version": "1.1.0",
+  "summary": "Auto-rotate + auto-resume for Claude Code under rate/session limits — swaps to the freshest account, relaunches headless loops; interactive is swap-only.",
+  "source": "master-kit:plugin/skills/devops/auto-advance",
+  "github": "https://github.com/primovera12/gnesis-vault/tree/main/auto-advance",
+  "tarball": "https://github.com/primovera12/gnesis-vault/releases/latest/download/auto-advance.tar.gz",
+  "install": "curl -fsSL -o auto-advance.tar.gz https://github.com/primovera12/gnesis-vault/releases/latest/download/auto-advance.tar.gz && tar xzf auto-advance.tar.gz && cd auto-advance && bash install.sh",
+  "usage_prompt": "Install auto-advance from the Gnesis Vault, then run /auto-advance start so autopilot auto-swaps accounts at the limit.",
+  "languages": [
+    "en",
+    "ar",
+    "es"
+  ],
+  "pages": {
+    "en": "pages/en.md",
+    "ar": "pages/ar.md",
+    "es": "pages/es.md"
+  },
+  "published_by": "push-to-genesis-vault",
+  "last_published": "2026-06-10T13:53:38Z"
+}

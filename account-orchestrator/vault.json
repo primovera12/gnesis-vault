@@ -1,0 +1,22 @@
+{
+  "name": "account-orchestrator",
+  "version": "2.1.0",
+  "summary": "Run many Claude Code accounts as one pool — live per-account usage, one account per project, and an automatic no-reload switch of a running chat before the limit.",
+  "source": "vault-native",
+  "github": "https://github.com/primovera12/gnesis-vault/tree/main/account-orchestrator",
+  "tarball": "https://github.com/primovera12/gnesis-vault/releases/latest/download/account-orchestrator.tar.gz",
+  "install": "curl -fsSL -o account-orchestrator.tar.gz https://github.com/primovera12/gnesis-vault/releases/latest/download/account-orchestrator.tar.gz && tar xzf account-orchestrator.tar.gz && cd account-orchestrator && bash install.sh",
+  "usage_prompt": "Install account-orchestrator from the Gnesis Vault; gives each project its own account and auto-switches running chats before the limit.",
+  "languages": [
+    "en",
+    "ar",
+    "es"
+  ],
+  "pages": {
+    "en": "pages/en.md",
+    "ar": "pages/ar.md",
+    "es": "pages/es.md"
+  },
+  "published_by": "push-to-genesis-vault",
+  "last_published": "2026-06-10T13:53:38Z"
+}
