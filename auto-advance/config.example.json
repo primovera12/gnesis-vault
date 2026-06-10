@@ -1,0 +1,29 @@
+{
+  "_comment": "claude-auto-advance config. Generic + public-safe — NO secrets live here (creds stay in each CLAUDE_CONFIG_DIR/.credentials.json, managed by the claude-acct-* tools). Copy to ~/.config/claude-auto-advance/config.json and edit.",
+
+  "interval_seconds": 60,
+  "switch_pct": 90,
+  "fresh_target_pct": 70,
+  "max_per_account": 2,
+  "flap_cooldown_seconds": 600,
+  "headless_max_retries": 200,
+  "notify": true,
+  "dry_run": false,
+
+  "interactive": {
+    "_comment": "Interactive VS Code/CLI sessions: SWAP-ONLY by design (Claude Code has no supported hands-free interactive resume — see README §Verification). On limit we swap creds instantly + notify; you press Up+Enter to continue on the fresh account.",
+    "swap_only": true,
+    "notify_on_swap": true
+  },
+
+  "headless_jobs": [
+    {
+      "_comment": "Each entry is a FULLY-AUTO supervised loop. `claude-auto-advance run-job <name>` ensures a non-maxed account, runs resume_cmd, and on a limit-stop swaps creds + relaunches `claude --continue` until the job finishes. config_dir is the account profile this job rides (its creds get hot-swapped). project_dir is where the conversation lives (so --continue resumes THAT project's last session).",
+      "name": "example-autopilot",
+      "config_dir": "~/.claude-acct1",
+      "project_dir": "~/projects/example",
+      "relaunch": true,
+      "resume_cmd": "claude -p --continue --dangerously-skip-permissions 'continue the task'"
+    }
+  ]
+}
