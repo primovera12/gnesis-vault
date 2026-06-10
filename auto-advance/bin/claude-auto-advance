@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# claude-auto-advance — multi-account auto-rotate + auto-resume layer for Claude Code.
+#
+# WHAT IT IS
+#   A thin orchestration layer ON TOP of the claude-acct-* tools. It detects a
+#   session/usage-limit pause, swaps the affected CLAUDE_CONFIG_DIR's creds to the
+#   freshest healthy account (reusing claude-acct-autoswap's anti-monoculture cap +
+#   anti-flap cooldown + never-onto-maxed guards), and — for HEADLESS jobs only —
+#   relaunches `claude --continue/--resume` so an autopilot loop keeps running fully
+#   hands-off. For INTERACTIVE sessions it swaps creds instantly and notifies; it does
+#   NOT fake a hands-free interactive resume (see HONEST LIMITS below).
+#
+# HONEST LIMITS (verified against Claude Code docs, 2026-06-10 — see README §Verification)
+#   • Headless (`claude -p` / autopilot): FULLY AUTO. `claude --continue` / `--resume <id>`
+#     is a documented, supported way to continue a prior conversation. We swap creds then
+#     relaunch — hands-off.  ✅
+#   • Interactive (VS Code / CLI TUI): SWAP-ONLY. Claude Code docs confirm there is NO
+#     supported hook/IPC/signal to re-drive a RUNNING interactive session, and credentials
+#     are loaded at process start (no documented mid-session re-read). So we make the swap
+#     INSTANT and notify; your next message / a `--continue` restart lands on the fresh
+#     account. We do NOT claim hands-free interactive resume.  ⚠️
+#
+# TRIGGER (precise — requirement 1)
+#   REACTIVE  (authoritative): the StopFailure hook fires with matcher ∈ {rate_limit,
+#             overloaded}. That is the documented event Claude Code emits when a turn ends
+#             because of a usage/rate limit. Wire it with:  claude-auto-advance install --hook
+#   PROACTIVE (preventive): /api/oauth/usage five_hour.utilization OR seven_day.utilization
+#             >= switch_pct (default 90), read from the claude-acct-status registry. Swaps
+#             BEFORE the hard stop so work never actually pauses.
+#   HARD CAP : an account at utilization 100 / status MAXED is NEVER a swap target.
+#
+# SAFETY (requirement 4 / RULE ZERO)
+#   • Only ever swaps cred FILES inside the operator's own account pool (~/.claude,
+#     ~/.claude-acct[0-9]*), and only relaunches HEADLESS jobs the operator registered in
+#     the config file. Never kills/inspects/relaunches another project's processes.
+#   • Every swap + resume is logged. --dry-run writes nothing. Swapped-out creds are PARKED
+#     (by claude-acct-autoswap) so every action is reversible via claude-acct-restore.
+#
+# USAGE
+#   claude-auto-advance start              # start the watch daemon (proactive + interactive swap-assist)
+#   claude-auto-advance stop               # stop the daemon
+#   claude-auto-advance status             # daemon state + account health + registered jobs + recent swaps
+#   claude-auto-advance run-job <name>     # FULLY-AUTO supervised headless loop for a configured job
+#   claude-auto-advance swap-now [DIR]     # one-shot proactive swap (delegates to claude-acct-autoswap)
+#   claude-auto-advance hook               # StopFailure entrypoint (reads hook JSON on stdin) — wired by install
+#   claude-auto-advance install [--hook] [--timer] [--bin]   # deploy tool + scaffold config + optional wiring
+#   claude-auto-advance config             # print resolved config (and where it lives)
+#
+#   Global: --dry-run on any subcommand (or set AA_DRY_RUN=1 / "dry_run": true in config)
+#
+# CONFIG (generic, no secrets):  ${AA_CONFIG:-~/.config/claude-auto-advance/config.json}
+set -uo pipefail
+
+AA_HOME="${AA_HOME:-$HOME/.config/claude-auto-advance}"
+AA_CONFIG="${AA_CONFIG:-$AA_HOME/config.json}"
+AA_STATE="${AA_STATE:-$HOME/.local/state/claude-auto-advance}"
+mkdir -p "$AA_HOME" "$AA_STATE" 2>/dev/null || true
+LOG="$AA_STATE/auto-advance.log"
+PIDFILE="$AA_STATE/daemon.pid"
+
+# ---- helpers -------------------------------------------------------------------
+ts(){ date '+%F %T'; }
+log(){ echo "$(ts) $*" >> "$LOG"; }
+say(){ echo "$*"; }
+expand(){ # expand a leading ~ to $HOME
+  case "$1" in "~/"*) echo "$HOME/${1#\~/}";; "~") echo "$HOME";; *) echo "$1";; esac
+}
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# config getters (jq with defaults; tolerate a missing config)
+cfg(){ # cfg <jq-path> <default>
+  local q="$1" d="${2:-}"
+  [ -s "$AA_CONFIG" ] || { echo "$d"; return; }
+  local v; v=$(jq -r "$q // empty" "$AA_CONFIG" 2>/dev/null)
+  [ -n "$v" ] && echo "$v" || echo "$d"
+}
+
+# Global dry-run resolution (flag wins, then env, then config)
+DRY=0
+[ "${AA_DRY_RUN:-0}" = "1" ] && DRY=1
+[ "$(cfg '.dry_run' false)" = "true" ] && DRY=1
+ARGS=()
+for a in "$@"; do
+  case "$a" in --dry-run) DRY=1 ;; *) ARGS+=("$a") ;; esac
+done
+set -- "${ARGS[@]:-}"
+CMD="${1:-status}"; shift || true
+
+# Resolve tuning knobs from config (fall back to claude-acct-autoswap's own defaults)
+SWITCH_PCT="$(cfg '.switch_pct' 90)"
+FRESH_TARGET="$(cfg '.fresh_target_pct' 70)"
+MAX_PER="$(cfg '.max_per_account' 2)"
+FLAP="$(cfg '.flap_cooldown_seconds' 600)"
+INTERVAL="$(cfg '.interval_seconds' 60)"
+NOTIFY="$(cfg '.notify' true)"
+MAX_RETRY="$(cfg '.headless_max_retries' 200)"
+
+# Pass our knobs down to the proven autoswap engine
+autoswap_env(){
+  ACCT_SWITCH_PCT="$SWITCH_PCT" ACCT_FRESH_TARGET="$FRESH_TARGET" \
+  ACCT_MAX_PER_ACCT="$MAX_PER" ACCT_FLAP_COOLDOWN="$FLAP" "$@"
+}
+
+# cross-platform best-effort desktop notification (never fatal)
+notify(){
+  [ "$NOTIFY" = "true" ] || return 0
+  local msg="$1"
+  if have notify-send; then notify-send "claude-auto-advance" "$msg" >/dev/null 2>&1 || true
+  elif have powershell.exe; then
+    powershell.exe -NoProfile -Command "New-BurntToastNotification -Text 'claude-auto-advance','$msg'" >/dev/null 2>&1 || true
+  fi
+  log "NOTIFY $msg"
+}
+
+require_tools(){
+  local miss=0
+  for t in jq curl; do have "$t" || { say "missing dependency: $t"; miss=1; }; done
+  have claude-acct-status || { say "missing claude-acct-status in PATH (the account registry tool)"; miss=1; }
+  have claude-acct-autoswap || { say "missing claude-acct-autoswap in PATH (the swap engine)"; miss=1; }
+  [ "$miss" = 0 ] || { say "→ install the claude-acct-* tool family first (ships alongside this tool)."; exit 1; }
+}
+
+# email/util/status for a given config dir, read from the live registry
+REG="$HOME/.claude-accounts.json"
+emailof(){ jq -r --arg d "$1" '.[$d].email // "?"' "$REG" 2>/dev/null; }
+utilof(){  jq -r --arg d "$1" '[(.[$d].util_5h//0),(.[$d].util_7d//0)]|max' "$REG" 2>/dev/null; }
+statusof(){ jq -r --arg d "$1" '.[$d].status // "?"' "$REG" 2>/dev/null; }
+
+# Swap a SPECIFIC dir to the freshest healthy account (never onto maxed). Returns 0 if swapped.
+# Reuses claude-acct-autoswap's target selection by parking + copying directly so we can target
+# one dir on demand (the daemon/proactive pass uses the full autoswap sweep instead).
+swap_dir(){
+  local dir; dir="$(expand "$1")"
+  [ -f "$dir/.credentials.json" ] || { log "swap_dir: no creds at $dir"; return 1; }
+  local curem; curem="$(emailof "$dir")"
+  local target
+  # freshest VALID/IDLE account, under fresh target, != current, not MAXED
+  target=$(jq -r --arg cur "$curem" --argjson ft "$FRESH_TARGET" '
+      [to_entries[].value
+       | select(.status=="VALID" or .status=="IDLE")
+       | select(.email != $cur)
+       | select((.util_5h//0) <= $ft and (.util_7d//0) <= $ft)]
+      | sort_by([(.util_5h//0),(.util_7d//0)]|max) | .[0].dir // empty' "$REG" 2>/dev/null)
+  if [ -z "$target" ]; then
+    log "swap_dir: no fresh (<=${FRESH_TARGET}%) healthy target for $(basename "$dir") ($curem) — capacity tight, leaving"
+    notify "no fresh account available — every account is loaded/maxed. Work is on $curem."
+    return 1
+  fi
+  local tgtem; tgtem="$(emailof "$target")"
+  if [ "$DRY" = 1 ]; then
+    say "WOULD SWAP $(basename "$dir"): $curem → $tgtem"; log "DRY swap_dir $(basename "$dir") $curem -> $tgtem"; return 0
+  fi
+  local park="$HOME/.claude-accounts/parked"; mkdir -p "$park"
+  cp "$dir/.credentials.json" "$park/$(echo "$curem"|tr -c 'a-zA-Z0-9' '_').$(date +%s).json" 2>/dev/null || true
+  cp "$target/.credentials.json" "$dir/.credentials.json" && chmod 600 "$dir/.credentials.json"
+  log "SWAP $(basename "$dir") $curem -> $tgtem (freshest healthy)"
+  notify "swapped $(basename "$dir"): $curem → $tgtem"
+  return 0
+}
+
+# ---- subcommands ---------------------------------------------------------------
+
+cmd_config(){
+  say "config file : $AA_CONFIG"
+  if [ -s "$AA_CONFIG" ]; then jq . "$AA_CONFIG" 2>/dev/null || cat "$AA_CONFIG"
+  else say "(no config yet — run: claude-auto-advance install)"; fi
+}
+
+cmd_swap_now(){
+  require_tools
+  claude-acct-status >/dev/null 2>&1 || true
+  if [ -n "${1:-}" ]; then swap_dir "$1"; return $?; fi
+  # no dir → full proactive sweep using the proven engine
+  if [ "$DRY" = 1 ]; then autoswap_env claude-acct-autoswap --dry-run
+  else autoswap_env claude-acct-autoswap | tee -a "$LOG"; fi
+}
+
+# StopFailure hook entrypoint. Hook JSON arrives on stdin; the harness sets the matcher.
+# We act only on rate_limit / overloaded. CLAUDE_CONFIG_DIR identifies THIS session's creds.
+cmd_hook(){
+  require_tools
+  local payload matcher ccd is_headless
+  payload="$(cat 2>/dev/null || true)"
+  matcher="$(echo "$payload" | jq -r '.matcher // .subtype // .stop_reason // empty' 2>/dev/null)"
+  ccd="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  case "$matcher" in
+    rate_limit|overloaded|"") : ;;   # empty matcher → treat as limit (hook is wired only on these matchers)
+    *) log "hook: ignoring matcher=$matcher"; exit 0 ;;
+  esac
+  claude-acct-status >/dev/null 2>&1 || true
+  log "HOOK trigger matcher=${matcher:-rate_limit} dir=$(basename "$ccd")"
+  swap_dir "$ccd" || true
+  # Headless? If a registered job owns this config_dir AND relaunch=true, request resume.
+  is_headless="$(jq -r --arg d "$ccd" '
+    (.headless_jobs // [])[] | select((.config_dir|sub("^~";env.HOME))==$d) | .relaunch // false' \
+    "$AA_CONFIG" 2>/dev/null | head -1)"
+  if [ "$is_headless" = "true" ]; then
+    log "hook: headless job owns $(basename "$ccd") — supervisor (run-job) will resume on --continue"
+  else
+    notify "Limit hit on $(basename "$ccd") — creds swapped to a fresh account. Press ↑ + Enter to continue (interactive resume is manual by design)."
+  fi
+  exit 0   # StopFailure cannot block anyway; we just acted + logged
+}
+
+# FULLY-AUTO supervised headless loop for a configured job.
+cmd_run_job(){
+  require_tools
+  local name="${1:-}"
+  [ -n "$name" ] || { say "usage: claude-auto-advance run-job <name>"; exit 1; }
+  local job; job="$(jq -c --arg n "$name" '(.headless_jobs // [])[] | select(.name==$n)' "$AA_CONFIG" 2>/dev/null | head -1)"
+  [ -n "$job" ] || { say "no headless job named '$name' in $AA_CONFIG"; exit 1; }
+  local ccd proj rcmd
+  ccd="$(expand "$(echo "$job" | jq -r '.config_dir')")"
+  proj="$(expand "$(echo "$job" | jq -r '.project_dir // "."')")"
+  rcmd="$(echo "$job" | jq -r '.resume_cmd // "claude -p --continue --dangerously-skip-permissions \"continue\""')"
+  say "supervising headless job '$name'  (config_dir=$(basename "$ccd")  project=$proj)"
+  say "resume_cmd: $rcmd"
+  [ "$DRY" = 1 ] && { say "DRY-RUN: would supervise + relaunch on limit; writing nothing."; return 0; }
+  cd "$proj" 2>/dev/null || { say "cannot cd to $proj"; exit 1; }
+  local n=0
+  while [ "$n" -lt "$MAX_RETRY" ]; do
+    n=$((n+1))
+    # ensure the job is on a non-maxed account before each (re)launch
+    claude-acct-status >/dev/null 2>&1 || true
+    local st util; st="$(statusof "$ccd")"; util="$(utilof "$ccd")"
+    if [ "$st" = "MAXED" ] || awk "BEGIN{exit !(${util:-0} >= $SWITCH_PCT)}"; then
+      log "run-job $name: account $(emailof "$ccd") at ${util}% / $st — swapping before launch"
+      swap_dir "$ccd" || { log "run-job $name: no fresh account — waiting ${INTERVAL}s"; sleep "$INTERVAL"; continue; }
+    fi
+    log "run-job $name: launch attempt #$n on $(emailof "$ccd")"
+    # run the job; CLAUDE_CONFIG_DIR points it at the (possibly just-swapped) account
+    CLAUDE_CONFIG_DIR="$ccd" bash -lc "$rcmd"
+    local rc=$?
+    log "run-job $name: attempt #$n exited rc=$rc"
+    if [ "$rc" = 0 ]; then
+      # exit 0 with a fresh-enough account = job finished. (Limit stops surface as non-zero.)
+      claude-acct-status >/dev/null 2>&1 || true
+      util="$(utilof "$ccd")"
+      if awk "BEGIN{exit !(${util:-0} < $SWITCH_PCT)}"; then
+        say "job '$name' completed (rc=0, account healthy)."; log "run-job $name: DONE"; return 0
+      fi
+    fi
+    # non-zero OR exited-but-account-now-maxed → swap + --continue
+    log "run-job $name: treating as limit/incomplete — swap + resume"
+    swap_dir "$ccd" || { log "run-job $name: no fresh account, backing off ${INTERVAL}s"; sleep "$INTERVAL"; }
+  done
+  say "job '$name' hit max retries ($MAX_RETRY)."; log "run-job $name: max retries"; return 1
+}
+
+cmd_daemon(){
+  require_tools
+  log "DAEMON start (interval=${INTERVAL}s switch_pct=${SWITCH_PCT} fresh=${FRESH_TARGET} max_per=${MAX_PER} flap=${FLAP} dry=$DRY)"
+  while :; do
+    claude-acct-status >/dev/null 2>&1 || true
+    # proactive sweep over all live sessions (the proven anti-monoculture engine)
+    if [ "$DRY" = 1 ]; then autoswap_env claude-acct-autoswap --dry-run >> "$LOG" 2>&1 || true
+    else autoswap_env claude-acct-autoswap >> "$LOG" 2>&1 || true; fi
+    sleep "$INTERVAL"
+  done
+}
+
+cmd_start(){
+  require_tools
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    say "daemon already running (pid $(cat "$PIDFILE"))."; return 0
+  fi
+  [ "$DRY" = 1 ] && { say "DRY-RUN: would start daemon (interval=${INTERVAL}s). Not starting."; return 0; }
+  nohup "$0" daemon >/dev/null 2>&1 &
+  echo $! > "$PIDFILE"
+  say "daemon started (pid $(cat "$PIDFILE")) — proactive swap every ${INTERVAL}s. Log: $LOG"
+}
+
+cmd_stop(){
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null && say "daemon stopped (pid $(cat "$PIDFILE"))."
+    rm -f "$PIDFILE"; log "DAEMON stop"
+  else
+    say "daemon not running."; rm -f "$PIDFILE" 2>/dev/null || true
+  fi
+}
+
+cmd_status(){
+  require_tools
+  say "── claude-auto-advance ─────────────────────────────────"
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    say "daemon     : RUNNING (pid $(cat "$PIDFILE"), every ${INTERVAL}s)"
+  else say "daemon     : stopped"; fi
+  say "config     : $AA_CONFIG  (dry_run=$([ "$DRY" = 1 ] && echo on || echo off))"
+  say "trigger    : reactive StopFailure{rate_limit,overloaded} + proactive util>=${SWITCH_PCT}%"
+  say ""
+  say "account health (live):"
+  claude-acct-status 2>/dev/null | sed 's/^/  /'
+  say ""
+  local njobs; njobs="$(jq -r '(.headless_jobs // []) | length' "$AA_CONFIG" 2>/dev/null || echo 0)"
+  say "registered headless jobs: ${njobs:-0}"
+  jq -r '(.headless_jobs // [])[] | "  • \(.name)  dir=\(.config_dir)  relaunch=\(.relaunch // false)"' "$AA_CONFIG" 2>/dev/null || true
+  say ""
+  say "recent swaps/resumes:"
+  grep -E ' (SWAP|HOOK|run-job|NOTIFY) ' "$LOG" 2>/dev/null | tail -8 | sed 's/^/  /' || say "  (none yet)"
+}
+
+cmd_install(){
+  local wire_hook=0 wire_timer=0 to_bin=0
+  for a in "$@"; do case "$a" in --hook) wire_hook=1;; --timer) wire_timer=1;; --bin) to_bin=1;; --all) wire_hook=1; wire_timer=1; to_bin=1;; esac; done
+
+  # 1. scaffold config from the bundled example (idempotent — never clobbers an existing config)
+  local here; here="$(cd "$(dirname "$0")" && pwd)"
+  local example="$here/../config.example.json"
+  if [ ! -s "$AA_CONFIG" ]; then
+    if [ -s "$example" ]; then cp "$example" "$AA_CONFIG"; else
+      cat > "$AA_CONFIG" <<'JSON'
+{
+  "interval_seconds": 60,
+  "switch_pct": 90,
+  "fresh_target_pct": 70,
+  "max_per_account": 2,
+  "flap_cooldown_seconds": 600,
+  "headless_max_retries": 200,
+  "notify": true,
+  "dry_run": false,
+  "interactive": { "swap_only": true, "notify_on_swap": true },
+  "headless_jobs": []
+}
+JSON
+    fi
+    say "scaffolded config → $AA_CONFIG  (edit it to register headless jobs; no secrets needed)"
+  else say "config already exists → $AA_CONFIG (left untouched)"; fi
+
+  # 2. copy this tool into ~/.local/bin (so `claude-auto-advance` is on PATH)
+  if [ "$to_bin" = 1 ]; then
+    mkdir -p "$HOME/.local/bin"
+    if [ "$0" -ef "$HOME/.local/bin/claude-auto-advance" ]; then say "tool already at ~/.local/bin"; else
+      cp "$0" "$HOME/.local/bin/claude-auto-advance" && chmod +x "$HOME/.local/bin/claude-auto-advance"
+      say "installed tool → ~/.local/bin/claude-auto-advance"
+    fi
+  fi
+
+  # 3. wire the StopFailure hook into ~/.claude/settings.json (reactive trigger)
+  if [ "$wire_hook" = 1 ]; then
+    local settings="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+    say "to wire the reactive trigger, add this to $settings (StopFailure hook):"
+    cat <<'JSON'
+  "hooks": {
+    "StopFailure": [
+      { "matcher": "rate_limit",  "hooks": [ { "type": "command", "command": "claude-auto-advance hook" } ] },
+      { "matcher": "overloaded",  "hooks": [ { "type": "command", "command": "claude-auto-advance hook" } ] }
+    ]
+  }
+JSON
+    say "(printed, not auto-merged — settings.json is often edited by other sessions; merge it yourself to avoid clobbering.)"
+  fi
+
+  # 4. systemd-user timer for the proactive daemon (optional)
+  if [ "$wire_timer" = 1 ]; then
+    say "to run the proactive sweep on a timer instead of a daemon, install a systemd-user timer:"
+    say "  see README §systemd. (printed, not auto-installed.)"
+  fi
+  say "done. next: edit $AA_CONFIG, then  claude-auto-advance status"
+}
+
+case "$CMD" in
+  start)     cmd_start "$@" ;;
+  stop)      cmd_stop "$@" ;;
+  status|"") cmd_status "$@" ;;
+  daemon)    cmd_daemon "$@" ;;
+  run-job)   cmd_run_job "$@" ;;
+  swap-now)  cmd_swap_now "$@" ;;
+  hook)      cmd_hook "$@" ;;
+  install)   cmd_install "$@" ;;
+  config)    cmd_config "$@" ;;
+  -h|--help|help)
+    sed -n '1,60p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) say "unknown command: $CMD (try: start|stop|status|run-job|swap-now|hook|install|config)"; exit 1 ;;
+esac

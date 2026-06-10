@@ -14,6 +14,7 @@ redeploy.
 | Skill                                           | What it does                                                                                                                                                               | Download                                                                     |
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | [`account-orchestrator`](account-orchestrator/) | Run many Claude Code accounts as one pool — live per-account usage, one account per project, and an automatic no-reload switch of a running chat before it hits the limit. | [latest tarball](../../releases/latest/download/account-orchestrator.tar.gz) |
+| [`auto-advance`](auto-advance/)                 | Auto-rotate + auto-resume under rate/session limits. Detects a usage-limit pause, swaps to the freshest account, and relaunches headless/autopilot loops (`claude --continue`) hands-off. Interactive sessions are swap-only by design. Builds on `account-orchestrator`.        | [latest tarball](../../releases/latest/download/auto-advance.tar.gz)         |
 
 ## Install a skill
 
