@@ -1,0 +1,37 @@
+{
+  "name": "decision-page",
+  "type": "skill",
+  "domain": "product",
+  "version": "1.0",
+  "owner": "kit",
+  "description": "Generate an interactive single-file HTML decision page for any substantive alignment moment where reasonable people would disagree \u2014 replacing a reply-by-reply trade-off thread with a click-to-pick canvas: each decision shown with from/to/opinion/recommendation, a sticky picks rail, accept-recommendations/reset/export actions, and localStorage persistence so picks survive reloads. Triggers on /decision, /decision-page, /alignment-canvas, 'decision page', 'alignment moment', 'click-to-pick', 'surface the trade-offs', 'make this decidable', 'decisions to align on', 'export my picks'.",
+  "triggers": {
+    "slash_commands": [
+      "/decision",
+      "/decision-page",
+      "/alignment-canvas"
+    ],
+    "keywords": [
+      "decision page",
+      "alignment moment",
+      "click-to-pick",
+      "surface the trade-offs",
+      "make this decidable",
+      "decisions to align on",
+      "export my picks",
+      "decision canvas",
+      "sticky picks rail"
+    ]
+  },
+  "depends_on": [],
+  "related": [
+    "stakeholder-update",
+    "executive-summary",
+    "perspective-checks"
+  ],
+  "supersedes": [],
+  "last_updated": "2026-05-23",
+  "tier": "production",
+  "score": 0,
+  "last_scored": "2026-05-23"
+}

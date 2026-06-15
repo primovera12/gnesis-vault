@@ -1,0 +1,22 @@
+{
+  "name": "decision-page",
+  "version": "2.1.0",
+  "summary": "\"Generate an interactive single-file HTML decision page for any substantive alignment moment where reasonable people would disagree — replacing a reply-by-reply trade-off thread ",
+  "source": "master-kit:plugin/skills/product/decision-page",
+  "github": "https://github.com/primovera12/gnesis-vault/tree/main/decision-page",
+  "tarball": "https://github.com/primovera12/gnesis-vault/releases/latest/download/decision-page.tar.gz",
+  "install": "curl -fsSL -o decision-page.tar.gz https://github.com/primovera12/gnesis-vault/releases/latest/download/decision-page.tar.gz && tar xzf decision-page.tar.gz && cd decision-page && bash install.sh",
+  "usage_prompt": "push to gnesis vault decision-page",
+  "languages": [
+    "en",
+    "ar",
+    "es"
+  ],
+  "pages": {
+    "en": "pages/en.md",
+    "ar": "pages/ar.md",
+    "es": "pages/es.md"
+  },
+  "published_by": "push-to-genesis-vault",
+  "last_published": "2026-06-15T23:29:45Z"
+}

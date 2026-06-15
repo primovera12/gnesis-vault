@@ -15,6 +15,7 @@ redeploy.
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | [`account-orchestrator`](account-orchestrator/) | Run many Claude Code accounts as one pool — live per-account usage, one account per project, and an automatic no-reload switch of a running chat before it hits the limit. | [latest tarball](../../releases/latest/download/account-orchestrator.tar.gz) |
 | [`auto-advance`](auto-advance/)                 | Auto-rotate + auto-resume under rate/session limits. Detects a usage-limit pause, swaps to the freshest account, and relaunches headless/autopilot loops (`claude --continue`) hands-off. Interactive sessions are swap-only by design. Builds on `account-orchestrator`.        | [latest tarball](../../releases/latest/download/auto-advance.tar.gz)         |
+| [`decision-page`](decision-page/) | "Generate an interactive single-file HTML decision page for any substantive alignment moment where reasonable people would disagree — replacing a reply-by-reply trade-off thread   | [latest tarball](../../releases/latest/download/decision-page.tar.gz) |
 
 > **Verified & honest about limits.** `auto-advance` is explicit about what's actually
 > hands-free. **Headless / autopilot** loops (`claude -p`) are **fully automatic** — on a
