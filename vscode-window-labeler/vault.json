@@ -1,0 +1,22 @@
+{
+  "name": "vscode-window-labeler",
+  "version": "1.0.0",
+  "summary": "Give every VS Code window a visible name and a distinct title-bar color so you can tell your projects apart at a glance.",
+  "source": "vault-native",
+  "github": "https://github.com/primovera12/gnesis-vault/tree/main/vscode-window-labeler",
+  "tarball": "https://github.com/primovera12/gnesis-vault/releases/latest/download/vscode-window-labeler.tar.gz",
+  "install": "curl -fsSL -o vscode-window-labeler.tar.gz https://github.com/primovera12/gnesis-vault/releases/latest/download/vscode-window-labeler.tar.gz && tar xzf vscode-window-labeler.tar.gz && cd vscode-window-labeler && bash install.sh",
+  "usage_prompt": "publish vscode-window-labeler to the vault",
+  "languages": [
+    "en",
+    "ar",
+    "es"
+  ],
+  "pages": {
+    "en": "pages/en.md",
+    "ar": "pages/ar.md",
+    "es": "pages/es.md"
+  },
+  "published_by": "push-to-genesis-vault",
+  "last_published": "2026-07-06T15:17:52Z"
+}
